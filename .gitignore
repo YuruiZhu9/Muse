@@ -19,8 +19,11 @@ Datasets/
 *.csv
 *.parquet
 
-# Claude
-.claude/
+# Claude - 只忽略个人配置，保留项目文档
+.claude/user-preferences.md
+.claude/settings.local.json
+.claude/thoughts/local/
+.claude/*.jsonl
 
 # OS
 .DS_Store

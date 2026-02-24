@@ -1,0 +1,43 @@
+[
+  {
+    "category": "functional",
+    "description": "示例功能：用户可以登录系统",
+    "steps": [
+      "打开登录页面",
+      "输入用户名和密码",
+      "点击登录按钮",
+      "验证跳转到首页"
+    ],
+    "passes": false
+  },
+  {
+    "category": "data",
+    "description": "示例功能：加载用户历史数据",
+    "steps": [
+      "用户登录后",
+      "系统自动加载历史记录",
+      "数据正确显示在界面中"
+    ],
+    "passes": false
+  },
+  {
+    "category": "ui",
+    "description": "示例功能：显示推荐结果列表",
+    "steps": [
+      "在首页",
+      "查看推荐区域",
+      "验证推荐内容显示正确"
+    ],
+    "passes": false
+  },
+  {
+    "category": "testing",
+    "description": "示例功能：为推荐算法添加单元测试",
+    "steps": [
+      "运行测试命令",
+      "验证所有测试通过",
+      "检查覆盖率报告"
+    ],
+    "passes": false
+  }
+]
