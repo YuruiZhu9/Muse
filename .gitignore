@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Data
+Datasets/
+*.csv
+*.parquet
+
+# Claude
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+nul
