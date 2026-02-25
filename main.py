@@ -254,18 +254,21 @@ class MuseRecSysPipeline:
         if enable_llm_features:
             # User state embeddings: [batch, 5, 2560]
             user_state = self.data_loader.get_user_state_embs(user_id)
+            # Expand to batch dimension: (5, 2560) -> (batch, 5, 2560)
             user_state_embs = torch.tensor(
-                [user_state.tolist()] * batch_size,
+                user_state,  # Already numpy array
                 dtype=torch.float32
-            ).to(DEVICE)
+            ).unsqueeze(0).expand(batch_size, -1, -1).to(DEVICE)
 
             # Item semantic embeddings: [batch, 2560]
             item_semantics = []
             for item_id in fused_candidates:
                 item_sem = self.data_loader.get_item_semantic_embs(item_id)
                 item_semantics.append(item_sem)
+            # Convert list to numpy array first, then to tensor (faster)
+            item_semantic_np = np.stack(item_semantics)
             item_semantic_embs = torch.tensor(
-                item_semantics,
+                item_semantic_np,
                 dtype=torch.float32
             ).to(DEVICE)
 
