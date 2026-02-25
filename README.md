@@ -1,93 +1,208 @@
-# MuseRecSys
+# MuseRecSys - LLM状态感知的多阶段推荐系统推理管线
 
+[![Python](https://img.shields.io/badge/Python-3.8%2B-blue)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-orange)](https://pytorch.org/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
+## 项目概述
 
-## Getting started
+MuseRecSys 是一个**模块化、高可扩展的推荐系统推理管线**，核心创新点在于引入 **LLM 编码的用户状态语义向量**，作为召回和精排阶段的增强特征。
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+### 核心特性
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+- **LLM 状态感知**：引入离线生成的 LLM 语义向量（2560维）作为召回和精排的增强特征
+- **可插拔设计**：通过 `ENABLE_LLM_FEATURES` 全局开关控制是否启用 LLM 模块，支持严格的 A/B 测试
+- **多阶段架构**：
+  - 数据层 (Data Layer)
+  - 召回层 (Recall Layer) - 4路并行召回
+  - 精排层 (Ranking Layer) - State-Enhanced DIN + MMoE
+  - 重排层 (Re-ranking Layer) - DPP多样性算法
+- **完整 Mock 数据**：基于 KuaiRec 数据集结构，支持离线测试
+- **智能依赖检测**：自动检测 faiss 是否安装，优雅降级
 
-## Add your files
-
-* [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+## 项目结构
 
 ```
-cd existing_repo
-git remote add origin https://jihulab.com/yuruizhu-group/muserecsys.git
-git branch -M main
-git push -uf origin main
+MuseRecSys/
+├── src/
+│   ├── __init__.py          # 模块初始化
+│   ├── config.py            # 全局配置
+│   ├── data_loader.py       # 数据层（Mock数据生成）
+│   ├── recall.py            # 召回层（4路召回）
+│   ├── ranking.py           # 精排层（DIN+MMoE）
+│   └── rerank.py            # 重排层（DPP/启发式）
+├── main.py                  # 主控流水线
+├── test_basic.py            # 基础功能测试
+├── requirements.txt         # 核心依赖
+├── requirements-llm.txt     # LLM功能额外依赖
+└── README.md                # 本文件
 ```
 
-## Integrate with your tools
+## 快速开始
 
-* [Set up project integrations](https://jihulab.com/yuruizhu-group/muserecsys/-/settings/integrations)
+### 1. 安装依赖
 
-## Collaborate with your team
+```bash
+# 安装核心依赖（必需）
+pip install -r requirements.txt
 
-* [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+# 可选：安装 faiss 以启用 LLM 语义召回功能
+pip install -r requirements-llm.txt
+```
 
-## Test and Deploy
+### 2. 运行测试
 
-Use the built-in continuous integration in GitLab.
+```bash
+# 基础功能测试（不含 LLM）
+python test_basic.py
+```
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+### 3. 运行完整流水线
 
-***
+```bash
+# 运行主程序
+python main.py
+```
 
-# Editing this README
+## 环境要求
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+- Python 3.8+
+- numpy >= 1.21.0
+- torch >= 2.0.0
+- faiss-cpu >= 1.7.0 (可选，用于 LLM 语义召回)
 
-## Suggestions for a good README
+## 配置说明
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+全局配置在 `src/config.py` 中：
 
-## Name
-Choose a self-explaining name for your project.
+```python
+# LLM特征开关
+ENABLE_LLM_FEATURES = True  # 设为False回退到传统模式
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+# 数据配置
+NUM_USERS = 1000
+NUM_ITEMS = 5000
+EMB_DIM = 2560
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+# 召回配置
+RECALL_FUSE_SIZE = 100
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+# 精排配置
+RANKING_TOP_K = 50
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+# 重排配置
+RERANK_CONFIG = {
+    'strategy': 'dpp',
+    'lambda_diversity': 0.5,
+    'final_size': 20
+}
+```
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+## 运行示例
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+### 基础推荐（不含 LLM）
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+```python
+from main import MuseRecSysPipeline
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+# 创建管线（自动检测 faiss 是否可用）
+pipeline = MuseRecSysPipeline(
+    num_users=100,
+    num_items=500,
+    emb_dim=2560,
+    enable_llm_features=False  # 明确禁用 LLM
+)
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+# 运行推荐
+results = pipeline.run_for_user(user_id=0)
+final_rec = results['final_recommendations']
+print(f"推荐结果: {[r['item_id'] for r in final_rec]}")
+```
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+### A/B 测试（需要 faiss）
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+```python
+# 创建管线并运行 A/B 测试
+pipeline = MuseRecSysPipeline(enable_llm_features=True)
+ab_results = pipeline.run_ab_test(user_id=42, final_size=20)
 
-## License
-For open source projects, say how it is licensed.
+# 查看对比结果
+print("LLM启用:", ab_results['llm_enabled']['recommendations'])
+print("LLM禁用:", ab_results['llm_disabled']['recommendations'])
+print("重叠率:", ab_results['comparison']['overlap_pct'])
+```
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+## 故障排除
+
+### faiss 未安装
+
+如果看到以下提示：
+```
+[Warning] faiss not installed. LLM semantic recall will be disabled.
+```
+
+系统会自动禁用 LLM 功能并使用基础推荐模式。要启用 LLM 功能：
+
+```bash
+pip install faiss-cpu
+```
+
+### torch 不可用
+
+```bash
+pip install torch>=2.0.0
+```
+
+## 架构设计
+
+### 召回层 4 通道
+
+| 通道 | 描述 | LLM相关 |
+|------|------|---------|
+| Channel 1 | Two-Tower 双塔模型 | ✗ |
+| Channel 2 | Item2Item 协同过滤 | ✗ |
+| Channel 3 | Hot 热门榜单 | ✗ |
+| Channel 4 | **LLM 语义召回** | ✓ |
+
+### LLM 语义召回 (5变3逻辑)
+
+```
+V_profile  = Mean(long_term_intent, life_stage)
+V_intent   = Mean(psychological_demand, retrieval_suggestions)
+V_explore  = interest_growth_points
+```
+
+使用 Faiss IndexFlatIP 进行 Top-N 检索。
+
+## 扩展性
+
+系统采用模块化设计，支持：
+
+- **新增召回通道**：在 `HybridRecall` 类中添加新方法
+- **自定义精排模型**：继承 `StateEnhancedRankingModel`
+- **替换重排策略**：实现 `ReRanker` 的子类
+
+## 下一步计划
+
+1. 集成真实的 LLM 推理（LLM_part/）
+2. 替换为 KuaiRec 真实数据
+3. 添加离线评估指标
+4. 性能优化（批处理、量化）
+
+## 贡献指南
+
+欢迎提交 Issue 和 Pull Request！
+
+## 许可证
+
+MIT License
+
+## 致谢
+
+- KuaiRec 数据集: https://kuairec.com
+- Faiss 向量检索: https://github.com/facebookresearch/faiss
+- PyTorch: https://pytorch.org/
+
+---
+
+**MuseRecSys Team** - 2025
