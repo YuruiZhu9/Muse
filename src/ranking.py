@@ -133,31 +133,34 @@ class StateEnhancedRankingModel(nn.Module):
         # ===================================================================
         # Part 2: LLM Semantic Enhancement Components
         # ===================================================================
+        # Note: For A/B testing compatibility, we always initialize with LLM projection layers
+        # even if enable_llm_features is False. This allows dynamic switching at runtime.
 
-        if self.enable_llm_features:
-            # Projection layers: Map high-dimensional LLM embeddings to compact space
-            # user_state_embs: (batch, 5, 2560) -> (batch, 5, 64)
-            self.user_state_projection = nn.Linear(llm_semantic_dim, llm_proj_dim)
+        # Projection layers: Map high-dimensional LLM embeddings to compact space
+        # user_state_embs: (batch, 5, 2560) -> (batch, 5, 64)
+        self.user_state_projection = nn.Linear(llm_semantic_dim, llm_proj_dim)
 
-            # item_semantic_embs: (batch, 2560) -> (batch, 64)
-            self.item_semantic_projection = nn.Linear(llm_semantic_dim, llm_proj_dim)
+        # item_semantic_embs: (batch, 2560) -> (batch, 64)
+        self.item_semantic_projection = nn.Linear(llm_semantic_dim, llm_proj_dim)
 
-            # Semantic Attention: Fuses user states with target item semantics
-            # Query: Target item semantic (batch, 1, 64)
-            # Key/Value: User state embeddings (batch, 5, 64)
-            self.semantic_attention_hidden_dim = llm_proj_dim * 2
-            self.semantic_attention_layer = nn.Sequential(
-                nn.Linear(llm_proj_dim * 2, self.semantic_attention_hidden_dim),
-                nn.ReLU(),
-                nn.Linear(self.semantic_attention_hidden_dim, 1)
-            )
+        # Semantic Attention: Fuses user states with target item semantics
+        # Query: Target item semantic (batch, 1, 64)
+        # Key/Value: User state embeddings (batch, 5, 64)
+        self.semantic_attention_hidden_dim = llm_proj_dim * 2
+        self.semantic_attention_layer = nn.Sequential(
+            nn.Linear(llm_proj_dim * 2, self.semantic_attention_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.semantic_attention_hidden_dim, 1)
+        )
 
-            # Calculate final fusion dimension
-            # Base concat + Fused User Semantic + Target Item Semantic
-            self.fusion_dim = base_concat_dim + (2 * llm_proj_dim)
-        else:
-            # Without LLM features, only use base concat
-            self.fusion_dim = base_concat_dim
+        # Calculate final fusion dimension
+        # Always use the larger dimension (with LLM features) for A/B testing compatibility
+        # Base concat + Fused User Semantic + Target Item Semantic
+        self.fusion_dim = base_concat_dim + (2 * llm_proj_dim)
+
+        # Store base concat dim for dynamic padding when LLM features are disabled
+        self.base_concat_dim = base_concat_dim
+        self.llm_proj_dim = llm_proj_dim
 
         # ===================================================================
         # Part 3: MMoE (Multi-gate Mixture-of-Experts) Components
@@ -497,8 +500,19 @@ class StateEnhancedRankingModel(nn.Module):
                 target_item_semantic   # (batch, llm_proj_dim)
             ], dim=-1)  # (batch, base_concat_dim + 2*llm_proj_dim)
         else:
-            # Without LLM features, use base concat directly
-            fused_features = base_concat
+            # Without LLM features, pad with zeros to match model's input dimension
+            # This allows A/B testing with the same model instance
+            batch_size = base_concat.shape[0]
+            device = base_concat.device
+            dtype = base_concat.dtype
+
+            # Zero padding for LLM features
+            llm_padding = torch.zeros(batch_size, 2 * self.llm_proj_dim, dtype=dtype, device=device)
+
+            fused_features = torch.cat([
+                base_concat,
+                llm_padding  # (batch, 2*llm_proj_dim) - zero padding
+            ], dim=-1)  # (batch, base_concat_dim + 2*llm_proj_dim)
 
         # ===================================================================
         # Part 3: MMoE Multi-Task Prediction
