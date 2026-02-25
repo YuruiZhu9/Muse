@@ -18,6 +18,7 @@ class UserFeatures:
     age: int
     gender: int  # 0 for male, 1 for female
     user_active_degree: float  # Value between 0 and 1
+    feature_vector: np.ndarray  # Additional feature vector for model input
 
 
 @dataclass
@@ -27,6 +28,7 @@ class ItemFeatures:
     category_id: int
     tags: List[str]
     video_duration: int  # in seconds
+    feature_vector: np.ndarray  # Additional feature vector for model input
 
 
 @dataclass
@@ -128,11 +130,15 @@ class DataLoader:
             # Active degree: beta distribution for more realistic spread
             active_degree = float(np.random.beta(a=2, b=5))
 
+            # Feature vector for model input (32-dim)
+            feature_vector = np.random.randn(32).astype(np.float32)
+
             self._user_features[user_id] = UserFeatures(
                 user_id=user_id,
                 age=age,
                 gender=gender,
-                user_active_degree=active_degree
+                user_active_degree=active_degree,
+                feature_vector=feature_vector
             )
 
     def _generate_item_features(self) -> None:
@@ -149,11 +155,15 @@ class DataLoader:
             duration = int(np.random.lognormal(mean=4, sigma=1))
             duration = np.clip(duration, 30, 7200)  # 30 seconds to 2 hours
 
+            # Feature vector for model input (32-dim)
+            feature_vector = np.random.randn(32).astype(np.float32)
+
             self._item_features[item_id] = ItemFeatures(
                 item_id=item_id,
                 category_id=category_id,
                 tags=tags,
-                video_duration=duration
+                video_duration=duration,
+                feature_vector=feature_vector
             )
 
     def _generate_user_history(self) -> None:
