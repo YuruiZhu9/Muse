@@ -1,0 +1,97 @@
+【核心业务逻辑与技术约束】
+构建一个**“LLM 状态感知”**的多阶段推荐系统。
+核心创新点：引入离线生成的 LLM 语义向量（2560维）作为召回和精排的增强特征。
+全局实验开关：整个系统中必须存在一个全局变量或配置项 ENABLE_LLM_FEATURES = True/False。所有涉及 LLM 向量的召回通道、精排分支计算，都必须受到该开关控制。当设为 False 时，系统应当平滑回退到传统 ID 推荐模式。
+
+
+总体架构
+系统分为四个核心层，每层通过清晰接口解耦：
+
+数据层：提供用户/物品基础特征及 LLM 嵌入向量的 Mock 数据。
+召回层：实现四路并行召回通道（含 LLM 语义通道）。
+精排层：实现 State-Enhanced DIN + MMoE 模型，LLM 特征可插拔。
+重排层：实现启发式规则和 DPP 多样性算法。
+
+主控流水线：串联各层，并自动对比启用/禁用 LLM 的效果。
+
+
+【模块 1：Data Layer (data_loader.py)】
+实现一个 DataLoader 类，负责提供 Mock 数据和特征接口。
+基础特征：Mock 用户的历史行为序列 (Seq IDs)、目标物品 (Target ID) 及常规类别特征。
+LLM 语义特征 (Mock)：
+
+user_state_embs: 形状 [N_users, 5, 2560]。代表用户通过大模型离线生成的 5 组状态向量。
+这5个向量分别对应：[long_term_intent, life_stage, psychological_demand, retrieval_suggestions, interest_growth_points]。
+item_semantic_embs: 形状 [N_items, 2560]。代表候选物品的纯语义向量，由物品的标题/描述等文本通过相同 LLM 编码器离线生成。
+
+【模块 2：Recall Layer (recall.py)】
+实现 HybridRecall 类，包含 4 条召回通道。最后需对启用通道的结果进行去重和加权融合。
+
+Channel 1 (Two-Tower): 模拟传统双塔，返回随机候选 ID。
+Channel 2 (Item2Item): 采用ItemCF 逻辑。
+Channel 3 (Hot): 近期热门榜单召回。
+Channel 4 (LLM Semantic Recall - 关键创新)：
+受 ENABLE_LLM_FEATURES 控制。
+Faiss 初始化：将 Mock 的 item_semantic_embs (2560维) 加入 Faiss IndexFlatIP。
+
+5 变 3 逻辑归类（关键步骤）：将获取到的用户 5 个状态向量（2560维）在逻辑上进行 Average Pooling，合并为 3 个检索向量：
+V_profile (画像向量) = Mean(long_term_intent, life_stage)
+V_intent (意图向量) = Mean(psychological_demand, retrieval_suggestions)
+V_explore (探索向量) = interest_growth_points
+
+检索：分别拿这 3 个合并后的向量去 Faiss 中进行 Top-N 检索，然后汇总。
+
+Faiss 索引：
+
+预先用所有物品的语义向量（2560 维）构建 Faiss 索引（如 IndexFlatIP）。
+用上述三个向量分别检索 Top-N 物品，合并结果并去重。
+接口：self._llm_faiss_recall(user_state_vectors_3x2560)
+
+召回融合
+
+召回融合的方式采用：假设一共4个通道，每个召回了150个，则采用依次选择每个通道的高分item的方式来挑选，也就是说，假如最后只要选100个物品，现在有150*4=600个物品，则分别按照channel1 2 3 4的顺序从里面依次挑选第1,2,3…个高分物品：channel1的第一个，channel2的第一个……这样的方式，如果出现相同的item被挑选出来则删除，直到最后挑选到item的数量满足最后的要求（100）。
+对各通道结果按权重（可配置）进行加权融合，相同物品只保留最高分，输出最终候选集。
+
+
+
+【模块 3：Ranking Layer (ranking.py)】
+实现 StateEnhancedRankingModel 类 (基于 PyTorch nn.Module)。这是本项目的核心模型，要求结构如下：
+
+模型输入
+用户侧：
+用户 ID 及传统特征（年龄、性别等，可 Mock）
+用户历史行为序列（物品 ID 列表）
+LLM 用户状态：形状 [Batch,5, 2560]（5 个原始向量），当 ENABLE_LLM_FEATURES=False 时可置零或跳过
+
+物品侧：
+
+候选物品 ID
+物品类别 ID、标签 ID 等
+LLM 物品语义向量：形状 [Batch,1，2560]，与召回同源
+
+
+第一部分：Base DIN 链路 (Traditional)
+将 Target ID Embedding 与 Hist Seq ID Embeddings 进行 Attention，根据注意力分数加权 Pooling 得到历史行为序列 Embedding。
+将该序列 Embedding 与 Target ID Embedding、User ID Embedding 等拼接，得到 Base_Concat_Vector。
+
+第二部分：LLM 语义增强链路 (LLM Branch - 受开关控制)
+Projection: 将 User_State_Embs 和 Target_Item_Semantic_Emb 同时通过 nn.Linear 降维（2560 -> 64维）。
+Semantic Attention: 以降维后的 Target_Item_Semantic_Emb (1x64) 为 Query，以降维后的 User_State_Embs (5x64) 为 Key 和 Value 进行 Attention 计算。根据注意力分数加权融合，得到 1 条 Fused_User_Semantic_Emb (64维)。
+
+第三部分：Fusion & MMOE
+动态融合：
+如果 ENABLE_LLM_FEATURES == True: 将 Base_Concat_Vector、Fused_User_Semantic_Emb (1x64)、降维后的 Target_Item_Semantic_Emb (1x64) 三者拼接在一起。
+如果 ENABLE_LLM_FEATURES == False: 仅使用 Base_Concat_Vector。
+将上述拼接后的最终向量，送入上层网络（实现一个略简单的 MMOE 结构：包含多个 Experts，并通过 Gate 机制输出 CTR 和 CVR 两个任务的预测值）。
+
+【模块 4：Re-ranking Layer (rerank.py)】
+接收精排打分后的列表，进行多样性重排。
+
+Strategy 1 (Heuristic): 滑动窗口规则。实现一个逻辑：窗口大小为 3，窗口内不允许出现 3 个具有相同 Category ID 的 Item。
+Strategy 2 (DPP): 实现一个快速贪心版的 Determinantal Point Process (Fast Greedy MAP Inference)。使用 Item 的 2560 维语义向量（或随机 Mock 向量）计算余弦相似度作为 Kernel Matrix，结合精排打分提升列表多样性。
+
+【模块 5：Pipeline Controller (main.py)】
+串联全流程的主入口。
+定义 ENABLE_LLM_FEATURES 全局配置。
+执行完整 Pipeline：DataLoader -> Recall -> Ranking -> Re-ranking -> 输出推荐列表。
+A/B 对比执行：在 main 函数中自动运行两次对比（一次设为 True，一次设为 False），并在终端打印出两次推荐列表的 ID 差异及各自链路的耗时，以直观展示引入 LLM 语义特征后的系统级影响。

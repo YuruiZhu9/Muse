@@ -139,16 +139,19 @@ class MuseRecSysPipeline:
         print("\n[3/4] Initializing Ranking Layer...")
         self.ranking_model = StateEnhancedRankingModel(
             num_users=num_users,
-            num_items=num_items,
+            num_items=num_items + 1,
             user_feature_dim=32,  # DataLoader feature vector dimension
             item_feature_dim=32,
             embedding_dim=RANKING_CONFIG['user_id_dim'],
             history_len=MAX_HISTORY_LEN,
             llm_semantic_dim=emb_dim,
             llm_proj_dim=RANKING_CONFIG['llm_proj_dim'],
+            attention_hidden_dim=RANKING_CONFIG['attention_hidden_dim'],
             num_experts=RANKING_CONFIG['num_experts'],
             expert_hidden_dim=RANKING_CONFIG['expert_hidden_dim'],
-            enable_llm_features=enable_llm_features
+            enable_llm_features=enable_llm_features,
+            semantic_num_heads=RANKING_CONFIG.get('semantic_num_heads', 4),
+            semantic_dropout=RANKING_CONFIG.get('semantic_dropout', 0.0),
         ).to(DEVICE)
         print(f"  Ranking model: State-Enhanced DIN + MMoE")
         print(f"  Device: {DEVICE}")
@@ -198,7 +201,12 @@ class MuseRecSysPipeline:
         # Stage 1: Recall
         # ====================================================================
         start_time = time.time()
-        recall_results = self.recall.recall(user_id)
+        original_recall_flag = self.recall.enable_llm_features
+        self.recall.enable_llm_features = enable_llm_features
+        try:
+            recall_results = self.recall.recall(user_id)
+        finally:
+            self.recall.enable_llm_features = original_recall_flag
         timing['recall'] = time.time() - start_time
         results['recall_results'] = recall_results
 
@@ -221,8 +229,11 @@ class MuseRecSysPipeline:
         user_features = self.data_loader._user_features[user_id]
         user_history = self.data_loader.get_user_history(user_id, MAX_HISTORY_LEN)
 
-        # Pad history to fixed length
-        hist_padded = user_history + [0] * (MAX_HISTORY_LEN - len(user_history))
+        # Reserve 0 for padding and shift real item ids by +1 before entering the model.
+        hist_padded = [0] * MAX_HISTORY_LEN
+        if user_history:
+            offset_history = [int(item_id) + 1 for item_id in user_history[-MAX_HISTORY_LEN:]]
+            hist_padded[-len(offset_history):] = offset_history
 
         # Prepare batch inputs for all candidates
         batch_size = len(fused_candidates)
@@ -230,7 +241,7 @@ class MuseRecSysPipeline:
         # Convert to tensors
         user_ids = torch.tensor([user_id] * batch_size, dtype=torch.long).to(DEVICE)
         hist_item_ids = torch.tensor([hist_padded] * batch_size, dtype=torch.long).to(DEVICE)
-        target_item_ids = torch.tensor(fused_candidates, dtype=torch.long).to(DEVICE)
+        target_item_ids = torch.tensor([int(item_id) + 1 for item_id in fused_candidates], dtype=torch.long).to(DEVICE)
 
         # User features
         user_feat_tensor = torch.tensor(
@@ -314,6 +325,7 @@ class MuseRecSysPipeline:
         # Prepare data for re-ranking
         item_ids = [item['item_id'] for item in ranked_items]
         scores = np.array([item['score'] for item in ranked_items])
+        seen_item_ids = set(user_history)
 
         # Get semantic embeddings for DPP
         semantic_embs = None
@@ -323,22 +335,22 @@ class MuseRecSysPipeline:
                 for item_id in item_ids
             ])
 
-        # Run re-ranking
-        if RERANK_CONFIG['strategy'] == 'dpp' and semantic_embs is not None:
-            reranked_items = self.reranker.dpp_rerank(
-                ranked_items=ranked_items,
-                scores=scores,
-                semantic_embs=semantic_embs,
-                final_size=RERANK_CONFIG['final_size'],
-                lambda_diversity=RERANK_CONFIG['lambda_diversity']
-            )
-        else:
-            reranked_items = self.reranker.heuristic_rerank(
-                ranked_items=ranked_items,
-                window_size=RERANK_CONFIG['window_size'],
-                max_same_category=RERANK_CONFIG['max_same_category']
-            )
-            reranked_items = reranked_items[:RERANK_CONFIG['final_size']]
+        # Run re-ranking plus lightweight list rules
+        reranked_items = self.reranker.rerank(
+            ranked_items=ranked_items,
+            scores=scores if semantic_embs is not None else None,
+            semantic_embs=semantic_embs,
+            final_size=RERANK_CONFIG['final_size'],
+            seen_item_ids=seen_item_ids,
+            filter_seen_items=RERANK_CONFIG.get('filter_seen_items', True),
+            prefix_diversity_top_n=RERANK_CONFIG.get('prefix_diversity_top_n', 5),
+            max_prefix_same_category=RERANK_CONFIG.get('max_prefix_same_category', 2),
+            max_consecutive_same_category=RERANK_CONFIG.get('max_consecutive_same_category', 1),
+            max_adjacent_semantic_similarity=RERANK_CONFIG.get('max_adjacent_semantic_similarity', 0.92),
+            window_size=RERANK_CONFIG['window_size'],
+            max_same_category=RERANK_CONFIG['max_same_category'],
+            lambda_diversity=RERANK_CONFIG['lambda_diversity'],
+        )
 
         timing['reranking'] = time.time() - start_time
         results['final_recommendations'] = reranked_items

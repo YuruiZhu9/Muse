@@ -69,7 +69,9 @@ RANKING_CONFIG = {
     "attention_hidden_dim": 128,
 
     # LLM语义降维
-    "llm_proj_dim": 64,  # 2560 -> 64
+    "llm_proj_dim": 128,  # 2560 -> 128 (grid-search optimal: heads=4)
+    "semantic_num_heads": 4,
+    "semantic_dropout": 0.0,
 
     # MMoE配置
     "num_experts": 4,
@@ -93,6 +95,13 @@ RERANK_CONFIG = {
     # DPP配置
     "lambda_diversity": 0.5,  # 多样性权重
     "final_size": 20,          # 最终推荐列表长度
+
+    # Lightweight list rules
+    "filter_seen_items": True,
+    "prefix_diversity_top_n": 5,
+    "max_prefix_same_category": 2,
+    "max_consecutive_same_category": 1,
+    "max_adjacent_semantic_similarity": 0.92,
 }
 
 

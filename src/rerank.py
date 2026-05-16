@@ -11,8 +11,8 @@ Date: 2025-02-25
 """
 
 import numpy as np
-from typing import List, Dict, Tuple, Optional
-from collections import defaultdict, deque
+from typing import Iterable, List, Dict, Tuple, Optional
+from collections import defaultdict
 
 
 class ReRanker:
@@ -43,6 +43,125 @@ class ReRanker:
         valid_strategies = ['heuristic', 'dpp', 'auto']
         if self.strategy not in valid_strategies:
             raise ValueError(f"Invalid strategy. Must be one of {valid_strategies}")
+
+    @staticmethod
+    def _normalize_embeddings(semantic_embs: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if semantic_embs is None:
+            return None
+        semantic_embs = np.asarray(semantic_embs, dtype=np.float32)
+        if semantic_embs.ndim != 2:
+            raise ValueError("semantic_embs must be a 2D array")
+        norms = np.linalg.norm(semantic_embs, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        return semantic_embs / norms
+
+    def _filter_seen_items(
+        self,
+        ranked_items: List[Dict],
+        scores: Optional[np.ndarray] = None,
+        semantic_embs: Optional[np.ndarray] = None,
+        seen_item_ids: Optional[Iterable[int]] = None,
+    ) -> Tuple[List[Dict], Optional[np.ndarray], Optional[np.ndarray]]:
+        if not ranked_items:
+            return [], scores, semantic_embs
+
+        seen_set = set(int(item_id) for item_id in seen_item_ids) if seen_item_ids is not None else set()
+        keep_indices = [
+            index for index, item in enumerate(ranked_items)
+            if int(item.get("item_id")) not in seen_set
+        ]
+
+        filtered_items = [ranked_items[index] for index in keep_indices]
+        filtered_scores = None if scores is None else np.asarray(scores)[keep_indices]
+        filtered_embs = None if semantic_embs is None else np.asarray(semantic_embs)[keep_indices]
+        return filtered_items, filtered_scores, filtered_embs
+
+    @staticmethod
+    def _tail_same_category_count(selected_items: List[Dict], category_id) -> int:
+        count = 0
+        for item in reversed(selected_items):
+            if item.get("category_id") != category_id:
+                break
+            count += 1
+        return count
+
+    def _apply_list_rules(
+        self,
+        ranked_items: List[Dict],
+        semantic_embs: Optional[np.ndarray] = None,
+        final_size: int = 50,
+        prefix_diversity_top_n: int = 5,
+        max_prefix_same_category: int = 2,
+        max_consecutive_same_category: int = 1,
+        max_adjacent_semantic_similarity: float = 0.92,
+    ) -> List[Dict]:
+        if not ranked_items:
+            return []
+
+        normalized_embs = self._normalize_embeddings(semantic_embs)
+        remaining_indices = list(range(len(ranked_items)))
+        selected_indices: List[int] = []
+        selected_items: List[Dict] = []
+        prefix_category_counts: Dict[int, int] = defaultdict(int)
+
+        def respects_constraints(candidate_index: int, relax_prefix: bool, relax_semantic: bool) -> bool:
+            candidate = ranked_items[candidate_index]
+            category_id = candidate.get("category_id")
+
+            if (
+                not relax_prefix
+                and len(selected_items) < prefix_diversity_top_n
+                and category_id is not None
+                and prefix_category_counts[category_id] >= max_prefix_same_category
+            ):
+                return False
+
+            if (
+                category_id is not None
+                and self._tail_same_category_count(selected_items, category_id) >= max_consecutive_same_category
+            ):
+                return False
+
+            if (
+                not relax_semantic
+                and normalized_embs is not None
+                and selected_indices
+            ):
+                last_selected_index = selected_indices[-1]
+                similarity = float(np.dot(normalized_embs[candidate_index], normalized_embs[last_selected_index]))
+                if similarity >= max_adjacent_semantic_similarity:
+                    return False
+
+            return True
+
+        while remaining_indices and len(selected_items) < final_size:
+            chosen_index = None
+
+            for relax_prefix, relax_semantic in (
+                (False, False),
+                (False, True),
+                (True, True),
+            ):
+                for candidate_index in remaining_indices:
+                    if respects_constraints(candidate_index, relax_prefix=relax_prefix, relax_semantic=relax_semantic):
+                        chosen_index = candidate_index
+                        break
+                if chosen_index is not None:
+                    break
+
+            if chosen_index is None:
+                chosen_index = remaining_indices[0]
+
+            remaining_indices.remove(chosen_index)
+            selected_indices.append(chosen_index)
+            selected_item = ranked_items[chosen_index]
+            selected_items.append(selected_item)
+
+            category_id = selected_item.get("category_id")
+            if category_id is not None and len(selected_items) <= prefix_diversity_top_n:
+                prefix_category_counts[category_id] += 1
+
+        return selected_items
 
     def heuristic_rerank(
         self,
@@ -411,6 +530,13 @@ class ReRanker:
         ranked_items: List[Dict],
         scores: Optional[np.ndarray] = None,
         semantic_embs: Optional[np.ndarray] = None,
+        final_size: int = 50,
+        seen_item_ids: Optional[Iterable[int]] = None,
+        filter_seen_items: bool = True,
+        prefix_diversity_top_n: int = 5,
+        max_prefix_same_category: int = 2,
+        max_consecutive_same_category: int = 1,
+        max_adjacent_semantic_similarity: float = 0.92,
         **kwargs
     ) -> List[Dict]:
         """
@@ -425,29 +551,77 @@ class ReRanker:
         Returns:
             Re-ranked list of items
         """
-        if self.strategy == 'heuristic':
-            return self.heuristic_rerank(ranked_items, **kwargs)
+        if filter_seen_items:
+            ranked_items, scores, semantic_embs = self._filter_seen_items(
+                ranked_items=ranked_items,
+                scores=scores,
+                semantic_embs=semantic_embs,
+                seen_item_ids=seen_item_ids,
+            )
 
+        if not ranked_items:
+            return []
+
+        rerank_candidate_size = min(len(ranked_items), max(final_size * 2, prefix_diversity_top_n * 2, final_size))
+        heuristic_kwargs = {
+            key: kwargs[key]
+            for key in ("window_size", "max_same_category")
+            if key in kwargs
+        }
+        dpp_kwargs = {
+            key: kwargs[key]
+            for key in ("lambda_diversity",)
+            if key in kwargs
+        }
+
+        if self.strategy == 'heuristic':
+            base_ranked_items = self.heuristic_rerank(ranked_items, **heuristic_kwargs)
         elif self.strategy == 'dpp':
             if scores is None or semantic_embs is None:
                 raise ValueError("DPP strategy requires both scores and semantic_embs")
-            return self.dpp_rerank(
+            base_ranked_items = self.dpp_rerank(
                 ranked_items,
                 scores,
                 semantic_embs,
-                **kwargs
+                final_size=rerank_candidate_size,
+                **dpp_kwargs
             )
-
         else:  # 'auto' - choose based on available data
             if scores is not None and semantic_embs is not None:
-                return self.dpp_rerank(
+                base_ranked_items = self.dpp_rerank(
                     ranked_items,
                     scores,
                     semantic_embs,
-                    **kwargs
+                    final_size=rerank_candidate_size,
+                    **dpp_kwargs
                 )
             else:
-                return self.heuristic_rerank(ranked_items, **kwargs)
+                base_ranked_items = self.heuristic_rerank(ranked_items, **heuristic_kwargs)
+
+        emb_by_item_id = None
+        if semantic_embs is not None:
+            emb_by_item_id = {
+                int(item["item_id"]): np.asarray(semantic_embs[index], dtype=np.float32)
+                for index, item in enumerate(ranked_items)
+            }
+            base_semantic_embs = np.stack(
+                [emb_by_item_id[int(item["item_id"])] for item in base_ranked_items],
+                axis=0
+            )
+        else:
+            base_semantic_embs = None
+
+        constrained_items = self._apply_list_rules(
+            ranked_items=base_ranked_items,
+            semantic_embs=base_semantic_embs,
+            final_size=final_size,
+            prefix_diversity_top_n=prefix_diversity_top_n,
+            max_prefix_same_category=max_prefix_same_category,
+            max_consecutive_same_category=max_consecutive_same_category,
+            max_adjacent_semantic_similarity=max_adjacent_semantic_similarity,
+        )
+
+        return constrained_items[:final_size]
 
 
 # ============================================================================

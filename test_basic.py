@@ -129,6 +129,10 @@ try:
     print(f"  召回通道: {list(results.keys())}")
     for channel, items in results.items():
         print(f"    {channel}: {len(items)} items")
+        history_set = set(loader.get_user_history(0))
+        assert all(item_id not in history_set for item_id, _ in items), (
+            f"channel {channel} should filter items from user history"
+        )
 
     # Test fusion
     fused = recall.fuse_recall_results(results, final_size=50)
@@ -144,17 +148,29 @@ print("\n[Test 5] 测试精排层...")
 try:
     model = StateEnhancedRankingModel(
         num_users=100,
-        num_items=500,
+        num_items=501,
         user_feature_dim=32,
         item_feature_dim=32,
         enable_llm_features=False
     )
 
+    # Verify DIN local activation uses the strict feature order [q, k, q-k, q*k]
+    target_embed = torch.tensor([[1.0, 2.0]])
+    history_embeds = torch.tensor([[[3.0, 4.0], [5.0, 6.0]]])
+    din_inputs = model._build_din_attention_input(target_embed, history_embeds)
+    expected_din_inputs = torch.tensor([
+        [
+            [1.0, 2.0, 3.0, 4.0, -2.0, -2.0, 3.0, 8.0],
+            [1.0, 2.0, 5.0, 6.0, -4.0, -4.0, 5.0, 12.0]
+        ]
+    ])
+    assert torch.allclose(din_inputs, expected_din_inputs), "DIN attention input is not [q, k, q-k, q*k]"
+
     # Test forward pass
     batch_size = 16
     user_id = torch.tensor([0] * batch_size)
-    hist_item_ids = torch.randint(0, 500, (batch_size, 20))
-    target_item_id = torch.randint(0, 500, (batch_size,))
+    hist_item_ids = torch.randint(0, 501, (batch_size, 20))
+    target_item_id = torch.randint(1, 501, (batch_size,))
     user_features = torch.randn(batch_size, 32)
     item_features = torch.randn(batch_size, 32)
 
@@ -169,6 +185,32 @@ try:
 
     print(f"  CTR output shape: {outputs['ctr'].shape}")
     print(f"  CVR output shape: {outputs['cvr'].shape}")
+
+    # Test semantic cross-attention masking: zero semantic slots must receive zero attention mass.
+    llm_model = StateEnhancedRankingModel(
+        num_users=10,
+        num_items=11,
+        user_feature_dim=32,
+        item_feature_dim=32,
+        llm_semantic_dim=8,
+        llm_proj_dim=8,
+        semantic_num_heads=2,
+        enable_llm_features=True
+    )
+    user_state_embs = torch.randn(1, 5, 8)
+    user_state_embs[:, 3:, :] = 0.0
+    item_semantic_embs = torch.randn(1, 8)
+    fused_user_semantic, target_item_semantic = llm_model.llm_semantic_enhancement(
+        user_state_embs=user_state_embs,
+        item_semantic_embs=item_semantic_embs
+    )
+    attn_weights = llm_model._latest_semantic_attention_weights
+    assert attn_weights is not None, "semantic attention weights were not recorded"
+    assert fused_user_semantic.shape == (1, 8)
+    assert target_item_semantic.shape == (1, 8)
+    assert torch.allclose(attn_weights[..., 3:], torch.zeros_like(attn_weights[..., 3:]), atol=1e-6), (
+        "masked semantic slots should receive zero attention weight"
+    )
     print("  [PASSED]")
 except Exception as e:
     print(f"  [FAILED] {e}")
@@ -188,6 +230,47 @@ try:
 
     reranked = reranker.heuristic_rerank(ranked_items, window_size=3, max_same_category=3)
     print(f"  启发式重排: {len(reranked)} items")
+
+    # Test lightweight list rules on top of base reranking
+    constrained_items = [
+        {'item_id': 0, 'category_id': 0, 'score': 0.99},
+        {'item_id': 1, 'category_id': 0, 'score': 0.98},
+        {'item_id': 2, 'category_id': 0, 'score': 0.97},
+        {'item_id': 3, 'category_id': 1, 'score': 0.96},
+        {'item_id': 4, 'category_id': 2, 'score': 0.95},
+    ]
+    constrained_embs = np.array([
+        [1.0, 0.0, 0.0],
+        [0.999, 0.001, 0.0],
+        [0.998, 0.002, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float32)
+    constrained_scores = np.array([item['score'] for item in constrained_items], dtype=np.float32)
+
+    constrained_reranked = reranker.rerank(
+        constrained_items,
+        scores=constrained_scores,
+        semantic_embs=constrained_embs,
+        final_size=4,
+        seen_item_ids={0},
+        filter_seen_items=True,
+        prefix_diversity_top_n=3,
+        max_prefix_same_category=1,
+        max_consecutive_same_category=1,
+        max_adjacent_semantic_similarity=0.95,
+        window_size=3,
+        max_same_category=3,
+    )
+
+    constrained_ids = [item['item_id'] for item in constrained_reranked]
+    constrained_categories = [item['category_id'] for item in constrained_reranked]
+    assert 0 not in constrained_ids, "seen items should be removed before reranking"
+    assert len(constrained_categories[:3]) == len(set(constrained_categories[:3])), (
+        "prefix results should avoid over-homogeneous categories"
+    )
+    for left, right in zip(constrained_categories, constrained_categories[1:]):
+        assert left != right, "consecutive results should not share the same category under the configured rule"
     print("  [PASSED]")
 except Exception as e:
     print(f"  [FAILED] {e}")

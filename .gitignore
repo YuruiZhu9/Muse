@@ -7,6 +7,10 @@ __pycache__/
 env/
 venv/
 ENV/
+.env
+.env.*
+!.env.example
+repo.txt
 
 # IDE
 .idea/
@@ -19,11 +23,28 @@ Datasets/
 *.csv
 *.parquet
 
+# Runtime outputs
+*.log
+*.tmp
+LLM_part/user_inferences*.jsonl
+LLM_part/user_contexts*.jsonl
+LLM_part/time_window_samples*.jsonl
+LLM_part/kuairec_*.json
+LLM_part/sweep_*.json
+LLM_part/Embedding_Qwen4B/
+LLM_part/SFT_Qwen1.7b/trandata_*.jsonl
+LLM_part/SFT_Qwen1.7b/qwen35_*finetuned*/
+
 # Claude - 只忽略个人配置，保留项目文档
 .claude/user-preferences.md
 .claude/settings.local.json
 .claude/thoughts/local/
+.claude/thoughts/shared/
+.claude/claude-progress.txt
 .claude/*.jsonl
+
+# Codex local state
+.codex/
 
 # OS
 .DS_Store

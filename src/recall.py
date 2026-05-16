@@ -61,6 +61,9 @@ class HybridRecall:
         self._hot_items: Optional[List[int]] = None
         self._llm_faiss_index = None  # Faiss index for semantic search
         self._item_semantic_embs: Optional[np.ndarray] = None
+        self._two_tower_item_embs: Optional[np.ndarray] = None  # pre-computed two-tower item embeddings
+        self._two_tower_faiss_index = None
+        self._two_tower_model = None  # trained TwoTowerModel for user encoding
 
         # Pre-load data for efficiency
         self._initialize_channels()
@@ -117,40 +120,118 @@ class HybridRecall:
             print(f"[LLM Recall] Error initializing LLM channel: {e}")
             self.enable_llm_features = False
 
+    def set_two_tower_index(self, item_emb_matrix: np.ndarray, two_tower_model=None):
+        """Set pre-computed two-tower item embeddings and model for real two-tower recall."""
+        try:
+            import faiss
+            self._two_tower_item_embs = item_emb_matrix.astype('float32')
+            self._two_tower_model = two_tower_model
+            faiss.normalize_L2(self._two_tower_item_embs)
+            dim = self._two_tower_item_embs.shape[1]
+            self._two_tower_faiss_index = faiss.IndexFlatIP(dim)
+            self._two_tower_faiss_index.add(self._two_tower_item_embs)
+            print(f"[Two-Tower] Real two-tower index ready: {len(item_emb_matrix)} items, dim={dim}")
+        except ImportError:
+            print("[Two-Tower] Faiss not available, falling back to centroid recall")
+        except Exception as e:
+            print(f"[Two-Tower] Error building index: {e}")
+
+    def _get_user_tower_embedding(self, user_id: int) -> Optional[np.ndarray]:
+        """Compute user embedding using trained user tower."""
+        if self._two_tower_model is None:
+            return None
+        user_state_embs = self.data_loader.load_user_state_embs()
+        if user_state_embs is None or user_id >= len(user_state_embs):
+            return None
+        states = user_state_embs[user_id]  # (5, 2560)
+        if states is None or not np.any(states):
+            return None
+        import torch
+        state_mean = torch.tensor(states, dtype=torch.float32).mean(dim=0).unsqueeze(0)
+        device = next(self._two_tower_model.parameters()).device
+        with torch.no_grad():
+            user_emb = self._two_tower_model.user_tower(state_mean.to(device)).cpu().numpy()
+        return user_emb
+
+    def _get_seen_item_ids(self, user_id: int) -> set:
+        user_history = self.data_loader.get_user_history(user_id)
+        return set(int(item_id) for item_id in user_history)
+
+    def _filter_seen_candidates(
+        self,
+        user_id: int,
+        candidates: List[Tuple[int, float]]
+    ) -> List[Tuple[int, float]]:
+        seen_item_ids = self._get_seen_item_ids(user_id)
+        if not seen_item_ids:
+            return candidates
+        return [
+            (item_id, score)
+            for item_id, score in candidates
+            if int(item_id) not in seen_item_ids
+        ]
+
     # ========================================================================
     # Channel 1: Two-Tower Model Recall
     # ========================================================================
 
     def _two_tower_recall(self, user_id: int, top_k: int = RECALL_PER_CHANNEL) -> List[Tuple[int, float]]:
-        """
-        Channel 1: Two-Tower Model Recall.
+        """Channel 1: Two-Tower Model Recall.
 
-        Simulates a traditional two-tower (user tower + item tower) model.
-        In production, this would use trained embeddings for user and items.
-        For now, returns random candidates with pseudo-scores.
-
-        Args:
-            user_id: The user ID to recall for
-            top_k: Number of items to recall
-
-        Returns:
-            List of (item_id, score) tuples
+        Uses a trained two-tower model (if available) or falls back to
+        centroid-based recall using semantic embeddings.
         """
         num_items = self.data_loader.num_items
-
         if num_items == 0:
             return []
 
-        # Simulate recall with random sampling + scoring
-        # In production: user_emb = user_tower(user_id)
-        #              scores = item_tower_emb @ user_emb
+        history_set = self._get_seen_item_ids(user_id)
 
-        candidates = random.sample(range(num_items), min(top_k, num_items))
+        # Try real trained two-tower first
+        if self._two_tower_faiss_index is not None:
+            user_state = self._get_user_tower_embedding(user_id)
+            if user_state is not None:
+                query = user_state.astype('float32').reshape(1, -1)
+                import faiss
+                faiss.normalize_L2(query)
+                scores, indices = self._two_tower_faiss_index.search(query, top_k + len(history_set))
+                candidates = [
+                    (int(indices[0][i]), float(scores[0][i]))
+                    for i in range(len(indices[0]))
+                    if int(indices[0][i]) not in history_set
+                ]
+                return candidates[:top_k]
 
-        # Generate pseudo-scores (higher = better)
+        # Fallback: centroid-based recall using item semantic embeddings
+        user_history = self.data_loader.get_user_history(user_id)
+        all_item_embs = self.data_loader.load_item_semantic_embs()
+
+        if user_history and all_item_embs is not None and len(all_item_embs) == num_items:
+            history_embs = all_item_embs[user_history]
+            if len(history_embs) > 0:
+                user_emb = history_embs.mean(axis=0)
+                norm = np.linalg.norm(user_emb)
+                if norm > 0:
+                    user_emb = user_emb / norm
+                    item_norms = np.linalg.norm(all_item_embs, axis=1, keepdims=False)
+                    safe_item_norms = np.where(item_norms == 0, 1.0, item_norms)
+                    normalized_items = all_item_embs / safe_item_norms[:, None]
+                    scores = normalized_items @ user_emb
+                    candidates = [
+                        (item_id, float(score))
+                        for item_id, score in enumerate(scores)
+                        if item_id not in history_set
+                    ]
+                    candidates.sort(key=lambda x: x[1], reverse=True)
+                    return candidates[:top_k]
+
+        # Final fallback: random
+        candidate_pool = [item_id for item_id in range(num_items) if item_id not in history_set]
+        if not candidate_pool:
+            return []
+        candidates = random.sample(candidate_pool, min(top_k, len(candidate_pool)))
         results = [(item_id, random.random()) for item_id in candidates]
         results.sort(key=lambda x: x[1], reverse=True)
-
         return results
 
     # ========================================================================
@@ -225,9 +306,16 @@ class HybridRecall:
         if not self._hot_items:
             return []
 
+        seen_item_ids = self._get_seen_item_ids(user_id)
+
         # Score based on position (higher position = higher score)
-        results = [(item_id, 1.0 - (i / len(self._hot_items)))
-                   for i, item_id in enumerate(self._hot_items[:top_k])]
+        results = []
+        for i, item_id in enumerate(self._hot_items):
+            if item_id in seen_item_ids:
+                continue
+            results.append((item_id, 1.0 - (i / len(self._hot_items))))
+            if len(results) >= top_k:
+                break
 
         return results
 
@@ -354,6 +442,7 @@ class HybridRecall:
         # ====================================================================
 
         results = [(item_id, score) for item_id, score in all_results.items()]
+        results = self._filter_seen_candidates(user_id, results)
         results.sort(key=lambda x: x[1], reverse=True)
 
         return results[:top_k * 3]  # Return up to 3x top_k since we searched 3 vectors
@@ -446,40 +535,54 @@ class HybridRecall:
         Returns:
             List of item IDs (duplicates removed)
         """
-        # Get list of channel names
-        channel_names = list(recall_dict.keys())
-        num_channels = len(channel_names)
-
-        if num_channels == 0:
+        channel_names = [name for name, items in recall_dict.items() if items]
+        if not channel_names:
             return []
 
-        # Convert channel results to item lists (for round-robin)
-        channel_items = [recall_dict[ch] for ch in channel_names]
+        weights = {
+            name: RECALL_CHANNEL_CONFIG.get(name, {}).get("weight", 1.0)
+            for name in channel_names
+        }
+        positive_weights = [weight for weight in weights.values() if weight > 0]
+        if not positive_weights:
+            positive_weights = [1.0]
+        min_weight = min(positive_weights)
 
-        # Track seen items for deduplication
+        picks_per_round = {
+            name: max(1, int(round(weights[name] / min_weight)))
+            for name in channel_names
+        }
+
+        pointers = {name: 0 for name in channel_names}
         seen = set()
-        final_candidates = []
+        final_candidates: List[int] = []
 
-        # Round-robin selection
-        max_rounds = max(len(items) for items in channel_items) if channel_items else 0
+        while len(final_candidates) < final_size:
+            progressed = False
 
-        for round_idx in range(max_rounds):
-            for ch_idx in range(num_channels):
-                # Stop if we've reached target size
+            for channel_name in channel_names:
+                channel_results = recall_dict[channel_name]
+                picks_this_round = picks_per_round[channel_name]
+
+                for _ in range(picks_this_round):
+                    while pointers[channel_name] < len(channel_results):
+                        item_id, _ = channel_results[pointers[channel_name]]
+                        pointers[channel_name] += 1
+                        if item_id in seen:
+                            continue
+
+                        seen.add(item_id)
+                        final_candidates.append(item_id)
+                        progressed = True
+                        break
+
+                    if len(final_candidates) >= final_size:
+                        break
+
                 if len(final_candidates) >= final_size:
                     break
 
-                # Get next item from this channel
-                if round_idx < len(channel_items[ch_idx]):
-                    item_id, _ = channel_items[ch_idx][round_idx]
-
-                    # Add if not already seen
-                    if item_id not in seen:
-                        seen.add(item_id)
-                        final_candidates.append(item_id)
-
-            # Early exit if target reached
-            if len(final_candidates) >= final_size:
+            if not progressed:
                 break
 
         return final_candidates

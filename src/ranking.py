@@ -73,6 +73,8 @@ class StateEnhancedRankingModel(nn.Module):
         history_len (int): Maximum length of user history (default: 50)
         llm_semantic_dim (int): Dimension of LLM semantic embeddings (default: 2560)
         llm_proj_dim (int): Projection dimension for LLM features (default: 64)
+        attention_hidden_dim (Optional[int]): Hidden dimension of DIN attention MLP.
+            Defaults to 4 * embedding_dim when not provided.
         num_experts (int): Number of expert networks in MMoE (default: 4)
         expert_hidden_dim (int): Hidden dimension for expert networks (default: 128)
         enable_llm_features (bool): Whether to enable LLM semantic features
@@ -88,9 +90,13 @@ class StateEnhancedRankingModel(nn.Module):
         history_len: int = 50,
         llm_semantic_dim: int = 2560,
         llm_proj_dim: int = 64,
+        attention_hidden_dim: Optional[int] = None,
         num_experts: int = 4,
         expert_hidden_dim: int = 128,
-        enable_llm_features: bool = True
+        enable_llm_features: bool = True,
+        padding_idx: int = 0,
+        semantic_num_heads: int = 4,
+        semantic_dropout: float = 0.0,
     ):
         super(StateEnhancedRankingModel, self).__init__()
 
@@ -99,8 +105,18 @@ class StateEnhancedRankingModel(nn.Module):
         self.history_len = history_len
         self.llm_semantic_dim = llm_semantic_dim
         self.llm_proj_dim = llm_proj_dim
+        self.attention_hidden_dim = attention_hidden_dim or (embedding_dim * 4)
         self.num_experts = num_experts
         self.enable_llm_features = enable_llm_features
+        self.padding_idx = padding_idx
+        self.semantic_num_heads = semantic_num_heads
+        self.semantic_dropout = semantic_dropout
+
+        if llm_proj_dim % semantic_num_heads != 0:
+            raise ValueError(
+                f"llm_proj_dim ({llm_proj_dim}) must be divisible by semantic_num_heads ({semantic_num_heads})"
+            )
+        self.semantic_head_dim = llm_proj_dim // semantic_num_heads
 
         # ===================================================================
         # Part 1: Base DIN (Deep Interest Network) Components
@@ -108,14 +124,14 @@ class StateEnhancedRankingModel(nn.Module):
 
         # ID Embeddings: Map sparse IDs to dense vectors
         self.user_embedding = nn.Embedding(num_users, embedding_dim)
-        self.item_embedding = nn.Embedding(num_items, embedding_dim)
+        # Reserve padding_idx for masked history positions.
+        self.item_embedding = nn.Embedding(num_items, embedding_dim, padding_idx=padding_idx)
 
         # DIN Attention Layer
-        # Computes attention weights between target item and historical items
-        # Formula: attention_score = target^T * W * history + b
-        self.attention_hidden_dim = embedding_dim * 4  # As per DIN paper
+        # Computes attention weights between target item and historical items.
+        # Strict DIN local activation input: [q, k, q-k, q*k]
         self.attention_layer = nn.Sequential(
-            nn.Linear(embedding_dim * 2, self.attention_hidden_dim),
+            nn.Linear(embedding_dim * 4, self.attention_hidden_dim),
             nn.ReLU(),
             nn.Linear(self.attention_hidden_dim, 1)
         )
@@ -143,15 +159,29 @@ class StateEnhancedRankingModel(nn.Module):
         # item_semantic_embs: (batch, 2560) -> (batch, 64)
         self.item_semantic_projection = nn.Linear(llm_semantic_dim, llm_proj_dim)
 
-        # Semantic Attention: Fuses user states with target item semantics
-        # Query: Target item semantic (batch, 1, 64)
-        # Key/Value: User state embeddings (batch, 5, 64)
-        self.semantic_attention_hidden_dim = llm_proj_dim * 2
-        self.semantic_attention_layer = nn.Sequential(
-            nn.Linear(llm_proj_dim * 2, self.semantic_attention_hidden_dim),
+        # Semantic Cross-Attention:
+        # - target item projected semantic acts as the query
+        # - user semantic slots act as key/value
+        # - learnable slot embeddings encode the identity/order of the 5 semantic fields
+        self.semantic_slot_embedding = nn.Embedding(5, llm_proj_dim)
+        self.semantic_q_proj = nn.Linear(llm_proj_dim, llm_proj_dim)
+        self.semantic_k_proj = nn.Linear(llm_proj_dim, llm_proj_dim)
+        self.semantic_v_proj = nn.Linear(llm_proj_dim, llm_proj_dim)
+        self.semantic_out_proj = nn.Linear(llm_proj_dim, llm_proj_dim)
+        self.semantic_user_norm = nn.LayerNorm(llm_proj_dim)
+        self.semantic_item_norm = nn.LayerNorm(llm_proj_dim)
+        self.semantic_output_norm = nn.LayerNorm(llm_proj_dim)
+        self.semantic_attention_dropout = nn.Dropout(semantic_dropout)
+
+        # Residual gate keeps the target-aware branch stable by interpolating it
+        # with a masked mean pooled user semantic baseline.
+        self.semantic_residual_gate = nn.Sequential(
+            nn.Linear(llm_proj_dim * 3, llm_proj_dim),
             nn.ReLU(),
-            nn.Linear(self.semantic_attention_hidden_dim, 1)
+            nn.Linear(llm_proj_dim, llm_proj_dim),
+            nn.Sigmoid()
         )
+        self._latest_semantic_attention_weights: Optional[torch.Tensor] = None
 
         # Calculate final fusion dimension
         # Always use the larger dimension (with LLM features) for A/B testing compatibility
@@ -241,20 +271,12 @@ class StateEnhancedRankingModel(nn.Module):
 
         Attention Computation Steps:
         1. Expand target to match history sequence length
-        2. Concatenate target with each history item
+        2. Build strict DIN pairwise features [q, k, q-k, q*k]
         3. Pass through attention network to get scores
         4. Apply mask (if provided) and softmax to get weights
         5. Weighted sum of history embeddings
         """
-        batch_size, seq_len, embed_dim = history_embeds.shape
-
-        # Step 1: Expand target embedding to match sequence length
-        # target_embed: (batch, embed_dim) -> (batch, seq_len, embed_dim)
-        target_expanded = target_embed.unsqueeze(1).expand(-1, seq_len, -1)
-
-        # Step 2: Concatenate target and history for attention computation
-        # concat: (batch, seq_len, 2 * embed_dim)
-        concat_input = torch.cat([target_expanded, history_embeds], dim=-1)
+        concat_input = self._build_din_attention_input(target_embed, history_embeds)
 
         # Step 3: Compute attention scores
         # scores: (batch, seq_len, 1)
@@ -277,6 +299,98 @@ class StateEnhancedRankingModel(nn.Module):
         )
 
         return weighted_embed
+
+    def _build_din_attention_input(
+        self,
+        target_embed: torch.Tensor,
+        history_embeds: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Build strict DIN local activation inputs: [q, k, q-k, q*k].
+
+        Args:
+            target_embed: Target item embedding, shape (batch, embedding_dim)
+            history_embeds: Historical item embeddings, shape (batch, seq_len, embedding_dim)
+
+        Returns:
+            Tensor of shape (batch, seq_len, 4 * embedding_dim)
+        """
+        _, seq_len, _ = history_embeds.shape
+
+        # Broadcast the target item against each historical behavior.
+        target_expanded = target_embed.unsqueeze(1).expand(-1, seq_len, -1)
+
+        return torch.cat(
+            [
+                target_expanded,
+                history_embeds,
+                target_expanded - history_embeds,
+                target_expanded * history_embeds
+            ],
+            dim=-1
+        )
+
+    @staticmethod
+    def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the mean over valid positions only.
+
+        Args:
+            values: Tensor of shape (batch, seq_len, dim)
+            mask: Boolean mask of shape (batch, seq_len)
+
+        Returns:
+            Tensor of shape (batch, dim)
+        """
+        mask_float = mask.unsqueeze(-1).to(dtype=values.dtype)
+        summed = torch.sum(values * mask_float, dim=1)
+        denom = torch.clamp(mask_float.sum(dim=1), min=1.0)
+        return summed / denom
+
+    def _semantic_cross_attention(
+        self,
+        target_item_proj: torch.Tensor,
+        user_state_proj: torch.Tensor,
+        state_mask: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Target-aware multi-head cross-attention from item semantics to user semantic slots.
+
+        Args:
+            target_item_proj: Projected item semantic tensor, shape (batch, llm_proj_dim)
+            user_state_proj: Projected user state tensor, shape (batch, 5, llm_proj_dim)
+            state_mask: Valid-state mask, shape (batch, 5)
+
+        Returns:
+            attn_output: Target-aware semantic summary, shape (batch, llm_proj_dim)
+            attn_weights: Attention weights, shape (batch, num_heads, 1, 5)
+        """
+        batch_size, seq_len, _ = user_state_proj.shape
+
+        q = self.semantic_q_proj(target_item_proj).view(
+            batch_size, self.semantic_num_heads, 1, self.semantic_head_dim
+        )
+        k = self.semantic_k_proj(user_state_proj).view(
+            batch_size, seq_len, self.semantic_num_heads, self.semantic_head_dim
+        ).transpose(1, 2)
+        v = self.semantic_v_proj(user_state_proj).view(
+            batch_size, seq_len, self.semantic_num_heads, self.semantic_head_dim
+        ).transpose(1, 2)
+
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (self.semantic_head_dim ** 0.5)
+        attn_mask = state_mask.unsqueeze(1).unsqueeze(2)
+        attn_scores = attn_scores.masked_fill(~attn_mask, -1e9)
+
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        attn_weights = attn_weights * attn_mask.to(dtype=attn_weights.dtype)
+        attn_weights = attn_weights / torch.clamp(attn_weights.sum(dim=-1, keepdim=True), min=1e-9)
+        attn_weights = self.semantic_attention_dropout(attn_weights)
+
+        attn_output = torch.matmul(attn_weights, v).squeeze(2)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, self.llm_proj_dim)
+        attn_output = self.semantic_out_proj(attn_output)
+
+        return attn_output, attn_weights
 
     def llm_semantic_enhancement(
         self,
@@ -305,38 +419,41 @@ class StateEnhancedRankingModel(nn.Module):
         2. Apply semantic attention: target item queries user states
         3. Return fused representation and target item semantics
         """
-        batch_size = user_state_embs.shape[0]
+        batch_size, seq_len, _ = user_state_embs.shape
 
-        # Step 1: Project LLM embeddings to compact space
-        # user_state_embs: (batch, 5, 2560) -> (batch, 5, 64)
-        user_state_proj = self.user_state_projection(user_state_embs)
+        # Step 1: Build a semantic-slot mask from the raw embeddings.
+        # Zero vectors are treated as missing semantic slots.
+        state_mask = user_state_embs.abs().sum(dim=-1) > 0  # (batch, 5)
 
-        # item_semantic_embs: (batch, 2560) -> (batch, 64)
-        target_item_proj = self.item_semantic_projection(item_semantic_embs)
+        # Step 2: Project semantic features into a compact interaction space.
+        user_state_proj = self.user_state_projection(user_state_embs)  # (batch, 5, 64)
+        target_item_proj = self.item_semantic_projection(item_semantic_embs)  # (batch, 64)
 
-        # Step 2: Semantic Attention
-        # Use target item as query to attend to user's state aspects
-        # Query: target_item_proj (batch, 64) -> (batch, 1, 64)
-        # Key/Value: user_state_proj (batch, 5, 64)
-        target_expanded = target_item_proj.unsqueeze(1)  # (batch, 1, 64)
+        # Learnable slot embeddings keep the 5 semantic fields distinguishable.
+        slot_ids = torch.arange(seq_len, device=user_state_embs.device)
+        slot_embeds = self.semantic_slot_embedding(slot_ids).unsqueeze(0).expand(batch_size, -1, -1)
 
-        # Concatenate query with each user state for attention scoring
-        # user_state_expanded: (batch, 5, 64) -> (batch, 5, 64) for broadcasting
-        concat_input = torch.cat([
-            target_expanded.expand(-1, 5, -1),  # (batch, 5, 64)
-            user_state_proj  # (batch, 5, 64)
-        ], dim=-1)  # (batch, 5, 128)
+        mask_float = state_mask.unsqueeze(-1).to(dtype=user_state_proj.dtype)
+        user_state_proj = (user_state_proj + slot_embeds) * mask_float
+        user_state_proj = self.semantic_user_norm(user_state_proj)
+        user_state_proj = user_state_proj * mask_float
+        target_item_proj = self.semantic_item_norm(target_item_proj)
 
-        # Compute semantic attention scores
-        semantic_scores = self.semantic_attention_layer(concat_input).squeeze(-1)  # (batch, 5)
-        semantic_weights = F.softmax(semantic_scores, dim=-1)  # (batch, 5)
+        # Step 3: Target-aware multi-head cross-attention.
+        attn_output, attn_weights = self._semantic_cross_attention(
+            target_item_proj=target_item_proj,
+            user_state_proj=user_state_proj,
+            state_mask=state_mask
+        )
+        self._latest_semantic_attention_weights = attn_weights.detach()
 
-        # Step 3: Fused user semantic representation
-        # Weighted sum of user states based on target item relevance
-        fused_user_semantic = torch.sum(
-            user_state_proj * semantic_weights.unsqueeze(-1),
-            dim=1
-        )  # (batch, 64)
+        # Step 4: Residual gating between attention output and a robust masked mean baseline.
+        pooled_user_semantic = self._masked_mean(user_state_proj, state_mask)
+        semantic_gate = self.semantic_residual_gate(
+            torch.cat([attn_output, pooled_user_semantic, target_item_proj], dim=-1)
+        )
+        fused_user_semantic = semantic_gate * attn_output + (1.0 - semantic_gate) * pooled_user_semantic
+        fused_user_semantic = self.semantic_output_norm(fused_user_semantic)
 
         return fused_user_semantic, target_item_proj
 
@@ -461,8 +578,8 @@ class StateEnhancedRankingModel(nn.Module):
         # hist_item_ids: (batch, history_len)
         history_embeds = self.item_embedding(hist_item_ids)  # (batch, history_len, embedding_dim)
 
-        # Create mask for padded positions (assuming padding_id = 0)
-        hist_mask = hist_item_ids != 0  # (batch, history_len)
+        # Create mask for padded positions.
+        hist_mask = hist_item_ids != self.padding_idx  # (batch, history_len)
 
         # DIN Attention: Weighted pooling of historical items
         # sequence embedding captures relevant aspects of user history
@@ -560,22 +677,15 @@ class StateEnhancedRankingModel(nn.Module):
 
 
 class RankingLoss(nn.Module):
-    """
-    Combined loss function for multi-task ranking.
+    """Combined loss for multi-task ranking. Supports BCE (binary) and MSE (regression)."""
 
-    Computes weighted combination of CTR and CVR losses.
-    """
-
-    def __init__(self, ctr_weight: float = 1.0, cvr_weight: float = 1.0):
-        """
-        Args:
-            ctr_weight: Weight for CTR loss
-            cvr_weight: Weight for CVR loss
-        """
+    def __init__(self, ctr_weight: float = 1.0, cvr_weight: float = 1.0, regression: bool = False):
         super(RankingLoss, self).__init__()
         self.ctr_weight = ctr_weight
         self.cvr_weight = cvr_weight
-        self.bce_loss = nn.BCELoss()
+        self.regression = regression
+        self.ctr_loss_fn = nn.MSELoss() if regression else nn.BCELoss()
+        self.cvr_loss_fn = nn.BCELoss()
 
     def forward(
         self,
@@ -584,31 +694,10 @@ class RankingLoss(nn.Module):
         ctr_label: torch.Tensor,
         cvr_label: torch.Tensor
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """
-        Compute combined loss.
-
-        Args:
-            ctr_pred: CTR prediction, shape (batch, 1)
-            cvr_pred: CVR prediction, shape (batch, 1)
-            ctr_label: CTR ground truth (click or not), shape (batch, 1)
-            cvr_label: CVR ground truth (conversion or not), shape (batch, 1)
-
-        Returns:
-            total_loss: Combined weighted loss
-            loss_dict: Dictionary containing individual loss values
-        """
-        ctr_loss = self.bce_loss(ctr_pred, ctr_label)
-        cvr_loss = self.bce_loss(cvr_pred, cvr_label)
-
+        ctr_loss = self.ctr_loss_fn(ctr_pred, ctr_label)
+        cvr_loss = self.cvr_loss_fn(cvr_pred, cvr_label)
         total_loss = self.ctr_weight * ctr_loss + self.cvr_weight * cvr_loss
-
-        loss_dict = {
-            'total': total_loss.item(),
-            'ctr': ctr_loss.item(),
-            'cvr': cvr_loss.item()
-        }
-
-        return total_loss, loss_dict
+        return total_loss, {'total': total_loss.item(), 'ctr': ctr_loss.item(), 'cvr': cvr_loss.item()}
 
 
 # ============================================================================
@@ -640,9 +729,13 @@ def create_ranking_model(
         'history_len': 50,
         'llm_semantic_dim': 2560,
         'llm_proj_dim': 64,
+        'attention_hidden_dim': None,
         'num_experts': 4,
         'expert_hidden_dim': 128,
-        'enable_llm_features': ENABLE_LLM_FEATURES
+        'enable_llm_features': ENABLE_LLM_FEATURES,
+        'padding_idx': 0,
+        'semantic_num_heads': 4,
+        'semantic_dropout': 0.0,
     }
 
     if config is not None:

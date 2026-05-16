@@ -1,7 +1,11 @@
 # MuseRecSys - LLM功能的额外依赖
 # 安装方法: pip install -r requirements-llm.txt
 
+-r requirements.txt
 faiss-cpu>=1.7.0
+transformers>=4.40.0
+accelerate>=0.28.0
+bitsandbytes>=0.43.0
 
 # 如果你有 NVIDIA GPU 并安装了 CUDA，可以使用 GPU 版本以获得更好的性能:
 # pip uninstall faiss-cpu
